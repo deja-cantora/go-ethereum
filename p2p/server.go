@@ -113,9 +113,11 @@ func (srv *Server) PeerCount() int {
 
 // SuggestPeer injects an address into the outbound address pool.
 func (srv *Server) SuggestPeer(ip net.IP, port int, nodeID []byte) {
+	addr := &peerAddr{ip, uint64(port), nodeID}
 	select {
-	case srv.peerConnect <- &peerAddr{ip, uint64(port), nodeID}:
+	case srv.peerConnect <- addr:
 	default: // don't block
+		srvlog.Warnf("peer suggestion %v ignored", addr)
 	}
 }
 
@@ -246,12 +248,7 @@ func (srv *Server) Stop() {
 
 func (srv *Server) discLoop() {
 	for peer := range srv.peerDisconnect {
-		// peer has just disconnected. free up its slot.
-		srvlog.Infof("%v is gone", peer)
-		srv.peerSlots <- peer.slot
-		srv.lock.Lock()
-		srv.peers[peer.slot] = nil
-		srv.lock.Unlock()
+		srv.removePeer(peer)
 	}
 }
 
@@ -263,6 +260,7 @@ func (srv *Server) listenLoop() {
 	for {
 		select {
 		case slot := <-srv.peerSlots:
+			srvlog.Debugf("grabbed slot %v for listening", slot)
 			conn, err := srv.listener.Accept()
 			if err != nil {
 				srv.peerSlots <- slot
@@ -335,6 +333,7 @@ func (srv *Server) dialLoop() {
 		case desc := <-suggest:
 			// candidate peer found, will dial out asyncronously
 			// if connection fails slot will be released
+			srvlog.DebugDetailf("dial %v (%v)", desc, *slot)
 			go srv.dialPeer(desc, *slot)
 			// we can watch if more peers needed in the next loop
 			slots = srv.peerSlots
@@ -356,7 +355,7 @@ func (srv *Server) dialPeer(desc *peerAddr, slot int) {
 	srvlog.Debugf("Dialing %v (slot %d)\n", desc, slot)
 	conn, err := srv.Dialer.Dial(desc.Network(), desc.String())
 	if err != nil {
-		srvlog.Errorf("Dial error: %v", err)
+		srvlog.DebugDetailf("dial error: %v", err)
 		srv.peerSlots <- slot
 		return
 	}
@@ -384,7 +383,7 @@ func (srv *Server) addPeer(conn net.Conn, desc *peerAddr, slot int) *Peer {
 func (srv *Server) removePeer(peer *Peer) {
 	srv.lock.Lock()
 	defer srv.lock.Unlock()
-	srvlog.Debugf("Removing peer %v %v (slot %v)\n", peer, peer.slot)
+	srvlog.Debugf("Removing %v (slot %v)\n", peer, peer.slot)
 	if srv.peers[peer.slot] != peer {
 		srvlog.Warnln("Invalid peer to remove:", peer)
 		return
@@ -416,6 +415,7 @@ func (srv *Server) verifyPeer(addr *peerAddr) error {
 	return nil
 }
 
+// TODO replace with "Set"
 type Blacklist interface {
 	Get([]byte) (bool, error)
 	Put([]byte) error
